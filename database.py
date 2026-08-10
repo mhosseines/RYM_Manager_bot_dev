@@ -48,7 +48,7 @@ def compute_similarity(text_a: str, text_b: str) -> float:
 
 
 # ────────────────────────────────────────────
-# DATABASE SETUP  —  safe migration
+# DATABASE SETUP — safe migration
 # ────────────────────────────────────────────
 
 async def init_db():
@@ -66,7 +66,7 @@ async def init_db():
             )
         """)
 
-        # sources (RSS feeds)
+        # sources (RSS feeds and Telegram Channels)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS sources (
                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,14 +81,14 @@ async def init_db():
         # logs
         await db.execute("""
             CREATE TABLE IF NOT EXISTS logs (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                post_id    INTEGER NOT NULL,
-                action     TEXT NOT NULL,
-                timestamp  TEXT NOT NULL
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_id   INTEGER NOT NULL,
+                action    TEXT NOT NULL,
+                timestamp TEXT NOT NULL
             )
         """)
 
-        # blocked users  ← NEW
+        # blocked users
         await db.execute("""
             CREATE TABLE IF NOT EXISTS blocked_users (
                 user_id    INTEGER PRIMARY KEY,
@@ -109,6 +109,7 @@ async def init_db():
             ("source_type",     "TEXT DEFAULT 'user'"),
             ("source_name",     "TEXT"),
             ("source_url",      "TEXT"),
+            ("created_at",      "TEXT"),
         ]
         for col_name, col_definition in new_columns:
             try:
@@ -153,28 +154,19 @@ async def is_user_blocked(user_id: int) -> bool:
 
 
 # ────────────────────────────────────────────
-# RATE LIMITING  —  1 submission per minute per user
-# Stored in memory (resets when bot restarts, which is fine)
+# RATE LIMITING — 1 submission per minute per user
 # ────────────────────────────────────────────
 
-# How many seconds a user must wait between submissions
 RATE_LIMIT_SECONDS = 60
-
-# Dict:  user_id  →  timestamp of their last submission
 _last_submission: dict[int, datetime] = {}
 
 
 def check_rate_limit(user_id: int) -> int:
-    """
-    Check if the user is allowed to post right now.
-    Returns 0 if allowed, or the number of seconds they must still wait.
-    Always call BEFORE inserting a post.
-    """
     now = datetime.utcnow()
     last = _last_submission.get(user_id)
 
     if last is None:
-        return 0  # First time posting — always allowed
+        return 0
 
     elapsed = (now - last).total_seconds()
     remaining = RATE_LIMIT_SECONDS - elapsed
@@ -183,10 +175,6 @@ def check_rate_limit(user_id: int) -> int:
 
 
 def record_submission(user_id: int):
-    """
-    Record that this user just submitted a post.
-    Call this AFTER successfully inserting the post.
-    """
     _last_submission[user_id] = datetime.utcnow()
 
 
@@ -194,22 +182,30 @@ def record_submission(user_id: int):
 # SOURCES
 # ────────────────────────────────────────────
 
-async def add_source(name: str, url: str, priority: int = 5) -> int:
+async def add_source(name: str, url: str, priority: int = 5, source_type: str = "rss") -> int:
+    """Add a source (RSS or telegram_channel)."""
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
-            "INSERT OR IGNORE INTO sources (name, type, url, active, priority) VALUES (?, 'rss', ?, 1, ?)",
-            (name, url, priority)
+            "INSERT OR IGNORE INTO sources (name, type, url, active, priority) VALUES (?, ?, ?, 1, ?)",
+            (name, source_type, url, priority)
         )
         await db.commit()
         return cursor.lastrowid
 
 
-async def get_active_sources():
+async def get_active_sources(source_type: str = None):
+    """Get active sources. Optionally filter by type ('rss' or 'telegram_channel')."""
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT * FROM sources WHERE active = 1 ORDER BY priority ASC"
-        )
+        if source_type:
+            cursor = await db.execute(
+                "SELECT * FROM sources WHERE active = 1 AND type = ? ORDER BY priority ASC",
+                (source_type,)
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT * FROM sources WHERE active = 1 ORDER BY priority ASC"
+            )
         return await cursor.fetchall()
 
 
@@ -226,6 +222,17 @@ async def set_source_active(source_id: int, active: bool):
 # POSTS
 # ────────────────────────────────────────────
 
+async def is_source_url_seen(source_url: str) -> bool:
+    """Check if a post with exact source_url already exists."""
+    if not source_url:
+        return False
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT id FROM posts WHERE source_url = ? LIMIT 1", (source_url,)
+        )
+        return await cursor.fetchone() is not None
+
+
 async def add_post(
     content_type: str,
     text: str,
@@ -234,49 +241,52 @@ async def add_post(
     source_type: str = "user",
     source_name: str = None,
     source_url: str = None,
+    channel_msg_id: int = None,
 ) -> int:
     norm = normalize_text(text or "")
-    h    = make_hash(norm)
+    h    = make_hash(norm) if norm else ""
     similarity_flag = None
     similar_post_id = None
+    created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
     async with aiosqlite.connect(DB_NAME) as db:
 
         # Duplicate check — only published posts count
-        cursor = await db.execute(
-            "SELECT id FROM posts WHERE hash = ? AND status = 'published' LIMIT 1", (h,)
-        )
-        duplicate_row = await cursor.fetchone()
-
-        if duplicate_row:
-            similar_post_id = duplicate_row[0]
-            similarity_flag = "DUPLICATE"
-        else:
+        if h:
             cursor = await db.execute(
-                """SELECT id, normalized_text FROM posts
-                   WHERE status = 'published'
-                   ORDER BY id DESC LIMIT 50"""
+                "SELECT id FROM posts WHERE hash = ? AND status = 'published' LIMIT 1", (h,)
             )
-            recent_posts = await cursor.fetchall()
+            duplicate_row = await cursor.fetchone()
 
-            for existing_id, existing_norm in recent_posts:
-                if not existing_norm:
-                    continue
-                score = compute_similarity(norm, existing_norm)
-                if score >= 0.60:
-                    similar_post_id = existing_id
-                    similarity_flag = f"SIMILAR:{int(score * 100)}"
-                    break
+            if duplicate_row:
+                similar_post_id = duplicate_row[0]
+                similarity_flag = "DUPLICATE"
+            else:
+                cursor = await db.execute(
+                    """SELECT id, normalized_text FROM posts
+                       WHERE status = 'published'
+                       ORDER BY id DESC LIMIT 50"""
+                )
+                recent_posts = await cursor.fetchall()
+
+                for existing_id, existing_norm in recent_posts:
+                    if not existing_norm:
+                        continue
+                    score = compute_similarity(norm, existing_norm)
+                    if score >= 0.60:
+                        similar_post_id = existing_id
+                        similarity_flag = f"SIMILAR:{int(score * 100)}"
+                        break
 
         cursor = await db.execute(
             """INSERT INTO posts
                (user_id, content_type, text, file_id, status,
                 normalized_text, hash, similarity_flag, similar_post_id,
-                source_type, source_name, source_url)
-               VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
+                source_type, source_name, source_url, channel_msg_id, created_at)
+               VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (user_id, content_type, text, file_id,
              norm, h, similarity_flag, similar_post_id,
-             source_type, source_name, source_url)
+             source_type, source_name, source_url, channel_msg_id, created_at)
         )
         await db.commit()
         return cursor.lastrowid
@@ -290,6 +300,8 @@ async def get_post(post_id: int):
 
 
 async def hash_already_seen(h: str) -> bool:
+    if not h:
+        return False
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
             "SELECT id FROM posts WHERE hash = ? LIMIT 1", (h,)
@@ -314,22 +326,19 @@ async def save_channel_msg_id(post_id: int, msg_id: int):
 
 
 # ────────────────────────────────────────────
-# STATS  (for /status command)
+# STATS (for /status command)
 # ────────────────────────────────────────────
 
 async def get_stats() -> dict:
-    """Return a summary dict used by the /status admin command."""
     today = date.today().strftime("%Y-%m-%d")
 
     async with aiosqlite.connect(DB_NAME) as db:
 
-        # Pending posts (all time)
         cursor = await db.execute(
             "SELECT COUNT(*) FROM posts WHERE status = 'pending'"
         )
         pending = (await cursor.fetchone())[0]
 
-        # Published today
         cursor = await db.execute(
             """SELECT COUNT(*) FROM logs
                WHERE action = 'published' AND timestamp LIKE ?""",
@@ -337,7 +346,6 @@ async def get_stats() -> dict:
         )
         published_today = (await cursor.fetchone())[0]
 
-        # Rejected today
         cursor = await db.execute(
             """SELECT COUNT(*) FROM logs
                WHERE action = 'rejected' AND timestamp LIKE ?""",
@@ -345,7 +353,6 @@ async def get_stats() -> dict:
         )
         rejected_today = (await cursor.fetchone())[0]
 
-        # Submitted today (user only)
         cursor = await db.execute(
             """SELECT COUNT(*) FROM logs l
                JOIN posts p ON l.post_id = p.id
@@ -356,7 +363,6 @@ async def get_stats() -> dict:
         )
         user_submitted_today = (await cursor.fetchone())[0]
 
-        # RSS fetched today
         cursor = await db.execute(
             """SELECT COUNT(*) FROM logs
                WHERE action = 'rss_fetched' AND timestamp LIKE ?""",
@@ -364,13 +370,18 @@ async def get_stats() -> dict:
         )
         rss_today = (await cursor.fetchone())[0]
 
-        # Active RSS sources
+        cursor = await db.execute(
+            """SELECT COUNT(*) FROM logs
+               WHERE action = 'telegram_channel_fetched' AND timestamp LIKE ?""",
+            (f"{today}%",)
+        )
+        telegram_today = (await cursor.fetchone())[0]
+
         cursor = await db.execute(
             "SELECT COUNT(*) FROM sources WHERE active = 1"
         )
         active_sources = (await cursor.fetchone())[0]
 
-        # Blocked users
         cursor = await db.execute("SELECT COUNT(*) FROM blocked_users")
         blocked_count = (await cursor.fetchone())[0]
 
@@ -380,13 +391,13 @@ async def get_stats() -> dict:
         "rejected_today":       rejected_today,
         "user_submitted_today": user_submitted_today,
         "rss_today":            rss_today,
+        "telegram_today":       telegram_today,
         "active_sources":       active_sources,
         "blocked_users":        blocked_count,
     }
 
 
 async def get_pending_posts(limit: int = 10) -> list:
-    """Return the oldest pending posts for the /pending command."""
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
