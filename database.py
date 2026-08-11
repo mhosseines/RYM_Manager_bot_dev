@@ -3,6 +3,9 @@ import re
 import aiosqlite
 from datetime import datetime, date
 
+import logging
+logger = logging.getLogger(__name__)
+
 DB_NAME = "posts.db"
 
 
@@ -51,8 +54,57 @@ def compute_similarity(text_a: str, text_b: str) -> float:
 # DATABASE SETUP — safe migration
 # ────────────────────────────────────────────
 
+async def _migrate_posts_user_id_nullable(db: aiosqlite.Connection):
+    """
+    نسخه‌های قدیمی این پروژه جدول posts رو با user_id NOT NULL ساخته بودن.
+    چون RSS و کانال‌های تلگرام user_id ندارن (None هستن)، این تابع
+    قید NOT NULL رو با بازسازی امن جدول (بدون از دست رفتن هیچ داده‌ای) برمی‌داره.
+    اگر جدول از قبل درست باشه، این تابع کاری انجام نمی‌ده.
+    """
+    cursor = await db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='posts'"
+    )
+    if not await cursor.fetchone():
+        return  # جدول هنوز ساخته نشده
+
+    cursor = await db.execute("PRAGMA table_info(posts)")
+    columns = await cursor.fetchall()
+    user_id_col = next((c for c in columns if c[1] == "user_id"), None)
+
+    if not user_id_col or user_id_col[3] != 1:
+        return  # از قبل nullable هست
+
+    logger.info("Migrating posts table: در حال حذف قید NOT NULL از user_id…")
+
+    col_names = [c[1] for c in columns]
+
+    await db.execute("ALTER TABLE posts RENAME TO posts_old_migration")
+
+    col_defs = []
+    for c in columns:
+        name, col_type = c[1], (c[2] or "TEXT")
+        if name == "id":
+            col_defs.append("id INTEGER PRIMARY KEY AUTOINCREMENT")
+        elif name == "status":
+            col_defs.append("status TEXT DEFAULT 'pending'")
+        else:
+            col_defs.append(f"{name} {col_type}")   # بدون NOT NULL
+
+    await db.execute(f"CREATE TABLE posts ({', '.join(col_defs)})")
+
+    col_list = ", ".join(col_names)
+    await db.execute(
+        f"INSERT INTO posts ({col_list}) SELECT {col_list} FROM posts_old_migration"
+    )
+    await db.execute("DROP TABLE posts_old_migration")
+    await db.commit()
+
+    logger.info("✅ Migration انجام شد. همه‌ی پست‌های قبلی حفظ شدند.")
+
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
+
+        await _migrate_posts_user_id_nullable(db)
 
         # posts
         await db.execute("""

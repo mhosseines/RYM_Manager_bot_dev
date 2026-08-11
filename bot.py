@@ -1,6 +1,7 @@
 import asyncio
 import os
 import logging
+import time
 
 import aiohttp
 from dotenv import load_dotenv
@@ -14,6 +15,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.filters import CommandStart, Command
+from telegram_web_fetcher import run_telegram_web_fetcher
 
 import database as db
 from rss_fetcher import run_rss_fetcher
@@ -918,9 +920,48 @@ async def handle_bale_channel_post(post: dict, session: aiohttp.ClientSession):
     )
     await db.log_action(post_id, "published")
 
-async def bale_listener():
+async def get_bale_start_offset(session: aiohttp.ClientSession, listener_started_at: int) -> int:
+    """
+    Advance Bale's update offset at startup so old queued messages are not
+    forwarded after downtime.
+    """
     offset = 0
+    skipped = 0
+
+    while True:
+        params = {"offset": offset, "timeout": 0, "limit": 100}
+        async with session.get(
+            f"{BALE_API_URL}/getUpdates", params=params,
+            timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            data = await resp.json()
+
+        if not data.get("ok"):
+            logging.warning("Could not initialize Bale offset; starting from current offset.")
+            return offset
+
+        updates = data.get("result", [])
+        if not updates:
+            if skipped:
+                logging.info(f"Skipped {skipped} old Bale update(s) from downtime.")
+            return offset
+
+        for update in updates:
+            msg = update.get("message") or {}
+            message_date = msg.get("date")
+            if message_date and message_date >= listener_started_at:
+                if skipped:
+                    logging.info(f"Skipped {skipped} old Bale update(s) from downtime.")
+                return offset
+
+            skipped += 1
+            offset = update["update_id"] + 1
+
+
+async def bale_listener():
     async with aiohttp.ClientSession() as session:
+        listener_started_at = int(time.time())
+        offset = await get_bale_start_offset(session, listener_started_at)
         logging.info("Bale listener started.")
         while True:
             try:
@@ -939,6 +980,10 @@ async def bale_listener():
                     offset  = update["update_id"] + 1
                     msg     = update.get("message")
                     if msg and msg.get("chat", {}).get("type") == "channel":
+                        message_date = msg.get("date")
+                        if message_date and message_date < listener_started_at:
+                            logging.info("Bale post skipped because it is older than listener startup.")
+                            continue
                         try:
                             await handle_bale_channel_post(msg, session)
                         except Exception as e:
@@ -965,8 +1010,8 @@ async def main():
         dp.start_polling(bot),
         bale_listener(),
         run_rss_fetcher(notify_callback=send_to_admin),
+        run_telegram_web_fetcher(notify_callback=send_to_admin),   # ← این خط جدید
     )
-
 
 if __name__ == "__main__":
     asyncio.run(main())

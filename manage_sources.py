@@ -51,6 +51,19 @@ async def cmd_add(name: str, url: str, priority: int = 5):
         print(f"⚠️  This URL already exists in the database.")
 
 
+async def cmd_add_channel(name: str, username: str, priority: int = 5):
+    username = username.strip().lstrip("@")
+    url = f"https://t.me/s/{username}"
+    await db.init_db()
+    source_id = await db.add_source(name=name, url=url, priority=priority, source_type="telegram_channel")
+    if source_id:
+        print(f"✅ کانال #{source_id} اضافه شد: {name}")
+        print(f"   یوزرنیم: @{username}")
+        print(f"   Priority: {priority}")
+    else:
+        print(f"⚠️  این کانال از قبل در دیتابیس هست.")
+
+
 async def cmd_set_active(source_id: int, active: bool):
     await db.init_db()
     await db.set_source_active(source_id, active)
@@ -81,6 +94,16 @@ if __name__ == "__main__":
             url      = args[2]
             priority = int(args[3]) if len(args) > 3 else 5
             asyncio.run(cmd_add(name, url, priority))
+
+    elif args[0] == "add_channel":
+        if len(args) < 3:
+            print('Usage: python manage_sources.py add_channel "نام دلخواه" "یوزرنیم_کانال"')
+            print('مثال: python manage_sources.py add_channel "بی بی سی فارسی" "bbcpersian"')
+        else:
+            name     = args[1]
+            username = args[2]
+            priority = int(args[3]) if len(args) > 3 else 5
+            asyncio.run(cmd_add_channel(name, username, priority))
 
     elif args[0] == "disable":
         if len(args) < 2:
