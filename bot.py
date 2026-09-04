@@ -14,8 +14,14 @@ from aiogram.types import (
     BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
     ReplyKeyboardMarkup, KeyboardButton
 )
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import StateFilter
 from aiogram.filters import CommandStart, Command
 from telegram_web_fetcher import run_telegram_web_fetcher
+from bale_web_fetcher import run_bale_web_fetcher
+from formatter import format_for_channel
 
 import database as db
 from rss_fetcher import run_rss_fetcher
@@ -41,7 +47,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
-dp  = Dispatcher()
+dp  = Dispatcher(storage=MemoryStorage())
+
+class AddChannelStates(StatesGroup):
+    choosing_platform = State()
+    entering_username = State()
+    entering_name = State()
 
 BTN_HELP = "ℹ️ راهنما"
 BTN_CHANNEL = "📣 کانال"
@@ -172,6 +183,8 @@ async def setup_bot_commands():
         BotCommand(command="block", description="بلاک کاربر"),
         BotCommand(command="unblock", description="رفع بلاک کاربر"),
         BotCommand(command="help", description="راهنمای بات"),
+        BotCommand(command="addchannel", description="افزودن کانال جدید"),
+        BotCommand(command="channels", description="مدیریت کانال‌ها"),
     ]
 
     await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
@@ -410,6 +423,173 @@ async def cmd_unblock(message: Message):
             reply_markup=build_admin_reply_keyboard(),
         )
 
+# ────────────────────────────────────────────
+# ADMIN: CHANNEL MANAGEMENT (add / list / toggle / delete sources)
+# ────────────────────────────────────────────
+
+def build_channels_view(sources):
+    """متن + کیبورد اینلاین برای نمایش لیست منابع می‌سازه."""
+    platform_labels = {"rss": "RSS", "telegram_channel": "تلگرام", "bale_channel": "بله"}
+
+    rows = []
+    lines = ["📡 منابع ثبت‌شده:", "روی نام بزنید تا فعال/غیرفعال بشه، روی 🗑 بزنید تا حذف بشه.", ""]
+
+    for s in sources:
+        status_icon = "🟢" if s["active"] else "🔴"
+        platform = platform_labels.get(s["type"], s["type"])
+        rows.append([
+            InlineKeyboardButton(text=f"{status_icon} {s['name']}", callback_data=f"src_toggle_{s['id']}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"src_delete_{s['id']}"),
+        ])
+        state_fa = "فعال" if s["active"] else "غیرفعال"
+        lines.append(f"{s['id']}. [{platform}] {s['name']} — {state_fa}")
+
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(Command("channels"))
+async def cmd_channels(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    sources = await db.get_all_sources()
+    if not sources:
+        await message.answer(
+            "هیچ منبعی ثبت نشده. با /addchannel یکی اضافه کنید.",
+            reply_markup=build_admin_reply_keyboard(),
+        )
+        return
+
+    text, kb = build_channels_view(sources)
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("src_toggle_"))
+async def cb_toggle_source(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ شما مجاز نیستید.", show_alert=True)
+        return
+
+    source_id = int(callback.data.split("_")[-1])
+    sources = await db.get_all_sources()
+    source = next((s for s in sources if s["id"] == source_id), None)
+    if not source:
+        await callback.answer("پیدا نشد.", show_alert=True)
+        return
+
+    await db.set_source_active(source_id, not source["active"])
+    await callback.answer("✅ به‌روزرسانی شد.")
+
+    sources = await db.get_all_sources()
+    text, kb = build_channels_view(sources)
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("src_delete_"))
+async def cb_delete_source(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ شما مجاز نیستید.", show_alert=True)
+        return
+
+    source_id = int(callback.data.split("_")[-1])
+    await db.delete_source(source_id)
+    await callback.answer("🗑 حذف شد.")
+
+    sources = await db.get_all_sources()
+    if not sources:
+        await callback.message.edit_text("هیچ منبعی باقی نمونده.")
+        return
+
+    text, kb = build_channels_view(sources)
+    await callback.message.edit_text(text, reply_markup=kb)
+
+
+@dp.message(Command("addchannel"))
+async def cmd_addchannel(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📡 تلگرام", callback_data="addch_platform_telegram"),
+            InlineKeyboardButton(text="📨 بله", callback_data="addch_platform_bale"),
+        ],
+        [InlineKeyboardButton(text="❌ لغو", callback_data="addch_cancel")],
+    ])
+    await state.set_state(AddChannelStates.choosing_platform)
+    await message.answer("کانال جدید از کدوم پلتفرمه؟", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("addch_platform_"))
+async def cb_addch_platform(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ شما مجاز نیستید.", show_alert=True)
+        return
+
+    platform = callback.data.split("_")[-1]  # telegram یا bale
+    await state.update_data(platform=platform)
+    await state.set_state(AddChannelStates.entering_username)
+    await callback.message.edit_text("یوزرنیم کانال رو بدون @ بفرستید (مثلاً bbcpersian):")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "addch_cancel")
+async def cb_addch_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("لغو شد.")
+    await callback.answer()
+
+
+@dp.message(StateFilter(AddChannelStates.entering_username), F.text)
+async def process_add_channel_username(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    username = message.text.strip().lstrip("@")
+    await state.update_data(username=username)
+    await state.set_state(AddChannelStates.entering_name)
+    await message.answer("یک نام دلخواه برای این کانال بفرستید (برای نمایش در گزارش‌ها):")
+
+
+@dp.message(StateFilter(AddChannelStates.entering_name), F.text)
+async def process_add_channel_name(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    data = await state.get_data()
+    platform = data["platform"]
+    username = data["username"]
+    name = message.text.strip()
+
+    if platform == "telegram":
+        url, source_type, emoji = f"https://t.me/s/{username}", "telegram_channel", "📡"
+    else:
+        url, source_type, emoji = f"https://ble.ir/s/{username}", "bale_channel", "📨"
+
+    source_id = await db.add_source(name=name, url=url, priority=5, source_type=source_type)
+    await state.clear()
+
+    if source_id:
+        await message.answer(
+            f"✅ کانال اضافه شد.\n\n{emoji} {name}\n@{username}",
+            reply_markup=build_admin_reply_keyboard(),
+        )
+    else:
+        await message.answer(
+            "⚠️ این کانال از قبل در سیستم ثبت شده.",
+            reply_markup=build_admin_reply_keyboard(),
+        )
+
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if await state.get_state() is None:
+        await message.answer("چیزی برای لغو کردن نیست.")
+        return
+    await state.clear()
+    await message.answer("لغو شد.", reply_markup=build_admin_reply_keyboard())
 
 # ────────────────────────────────────────────
 # GUARD: runs before every user submission
@@ -814,13 +994,15 @@ async def handle_reject(callback: CallbackQuery):
 # ────────────────────────────────────────────
 
 async def publish_to_telegram_channel(content_type: str, text: str, file_id: str) -> int | None:
+    formatted_text = format_for_channel(text, BRAND_TAG)
+
     async def _send():
         if content_type == "photo" and file_id:
-            return await bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=text or None)
+            return await bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=formatted_text or None)
         elif content_type == "video" and file_id:
-            return await bot.send_video(chat_id=CHANNEL_ID, video=file_id, caption=text or None)
+            return await bot.send_video(chat_id=CHANNEL_ID, video=file_id, caption=formatted_text or None)
         else:
-            return await bot.send_message(chat_id=CHANNEL_ID, text=text)
+            return await bot.send_message(chat_id=CHANNEL_ID, text=formatted_text)
 
     try:
         sent = await throttled_publish(_send)
@@ -829,6 +1011,7 @@ async def publish_to_telegram_channel(content_type: str, text: str, file_id: str
         logging.error(f"Failed to publish to Telegram channel: {e}")
         return None
 
+
 # ────────────────────────────────────────────
 # BALE LISTENER
 # ────────────────────────────────────────────
@@ -836,6 +1019,7 @@ async def publish_to_telegram_channel(content_type: str, text: str, file_id: str
 async def handle_bale_channel_post(post: dict, session: aiohttp.ClientSession):
     text     = post.get("text") or post.get("caption") or ""
     new_text = text.replace(BALE_CHANNEL_USERNAME, TELEGRAM_CHANNEL_USERNAME)
+    formatted_text = format_for_channel(new_text, BRAND_TAG)
 
     # ── Duplicate check FIRST (before downloading any photo/video) ──
     # Only blocks EXACT duplicates. Bale has no admin review step,
@@ -865,7 +1049,7 @@ async def handle_bale_channel_post(post: dict, session: aiohttp.ClientSession):
             return await bot.send_photo(
                 chat_id=CHANNEL_ID,
                 photo=BufferedInputFile(photo_bytes, filename="photo.jpg"),
-                caption=new_text
+                caption=formatted_text
             )
         try:
             sent = await throttled_publish(_send)
@@ -889,7 +1073,7 @@ async def handle_bale_channel_post(post: dict, session: aiohttp.ClientSession):
             return await bot.send_video(
                 chat_id=CHANNEL_ID,
                 video=BufferedInputFile(video_bytes, filename="video.mp4"),
-                caption=new_text
+                caption=formatted_text
             )
         try:
             sent = await throttled_publish(_send)
@@ -903,7 +1087,7 @@ async def handle_bale_channel_post(post: dict, session: aiohttp.ClientSession):
             return
 
         async def _send():
-            return await bot.send_message(chat_id=CHANNEL_ID, text=new_text)
+            return await bot.send_message(chat_id=CHANNEL_ID, text=formatted_text)
         try:
             sent = await throttled_publish(_send)
         except Exception as e:
@@ -1010,8 +1194,8 @@ async def main():
         dp.start_polling(bot),
         bale_listener(),
         run_rss_fetcher(notify_callback=send_to_admin),
-        run_telegram_web_fetcher(notify_callback=send_to_admin),   # ← این خط جدید
+        run_telegram_web_fetcher(notify_callback=send_to_admin),
+        run_bale_web_fetcher(notify_callback=send_to_admin),   # ← این خط جدید
     )
-
 if __name__ == "__main__":
     asyncio.run(main())

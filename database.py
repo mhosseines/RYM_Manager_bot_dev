@@ -269,6 +269,21 @@ async def set_source_active(source_id: int, active: bool):
         )
         await db.commit()
 
+async def get_all_sources():
+    """همه‌ی منابع (فعال و غیرفعال) — برای پنل مدیریت کانال‌ها در بات."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM sources ORDER BY priority ASC, id ASC"
+        )
+        return await cursor.fetchall()
+
+
+async def delete_source(source_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM sources WHERE id = ?", (source_id,))
+        await db.commit()
+
 
 # ────────────────────────────────────────────
 # POSTS

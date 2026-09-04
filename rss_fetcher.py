@@ -135,7 +135,7 @@ async def fetch_all_sources(notify_callback):
     Fetch every active RSS source once.
     Called on a schedule by run_rss_fetcher().
     """
-    sources = await db.get_active_sources()
+    sources = await db.get_active_sources(source_type="rss")
 
     if not sources:
         logger.info("RSS fetcher: no active sources configured.")

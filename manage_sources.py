@@ -64,6 +64,17 @@ async def cmd_add_channel(name: str, username: str, priority: int = 5):
         print(f"⚠️  این کانال از قبل در دیتابیس هست.")
 
 
+async def cmd_add_bale_channel(name: str, username: str, priority: int = 5):
+    username = username.strip().lstrip("@")
+    url = f"https://ble.ir/s/{username}"
+    await db.init_db()
+    source_id = await db.add_source(name=name, url=url, priority=priority, source_type="bale_channel")
+    if source_id:
+        print(f"✅ کانال بله #{source_id} اضافه شد: {name}")
+        print(f"   یوزرنیم: @{username}")
+    else:
+        print(f"⚠️  این کانال از قبل در دیتابیس هست.")
+
 async def cmd_set_active(source_id: int, active: bool):
     await db.init_db()
     await db.set_source_active(source_id, active)
@@ -104,6 +115,15 @@ if __name__ == "__main__":
             username = args[2]
             priority = int(args[3]) if len(args) > 3 else 5
             asyncio.run(cmd_add_channel(name, username, priority))
+
+    elif args[0] == "add_bale_channel":
+        if len(args) < 3:
+            print('Usage: python manage_sources.py add_bale_channel "نام دلخواه" "یوزرنیم_کانال"')
+        else:
+            name     = args[1]
+            username = args[2]
+            priority = int(args[3]) if len(args) > 3 else 5
+            asyncio.run(cmd_add_bale_channel(name, username, priority))
 
     elif args[0] == "disable":
         if len(args) < 2:
