@@ -524,6 +524,13 @@ async def get_stats() -> dict:
             (f"{today}%",)
         )
         telegram_today = (await cursor.fetchone())[0]
+        
+        cursor = await db.execute(
+            """SELECT COUNT(*) FROM logs
+            WHERE action = 'bale_channel_fetched' AND timestamp LIKE ?""",
+            (f"{today}%",)
+        )
+        bale_today = (await cursor.fetchone())[0]
 
         cursor = await db.execute(
             "SELECT COUNT(*) FROM sources WHERE active = 1"
@@ -542,6 +549,8 @@ async def get_stats() -> dict:
         "telegram_today":       telegram_today,
         "active_sources":       active_sources,
         "blocked_users":        blocked_count,
+        "telegram_today":       telegram_today,
+        "bale_today":           bale_today,
     }
 
 

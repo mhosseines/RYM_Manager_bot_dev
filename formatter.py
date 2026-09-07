@@ -9,6 +9,21 @@ formatter.py
 
 import re
 
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U00002B00-\U00002BFF"
+    "\uFE0F"
+    "]+",
+    flags=re.UNICODE,
+)
+
+def strip_emojis(text: str) -> str:
+    if not text:
+        return ""
+    return EMOJI_PATTERN.sub("", text)
 
 def strip_source_signatures(text: str) -> str:
     """حذف امضا، لینک کانال مبدأ، و دعوت‌به‌عضویت از متن."""
@@ -50,12 +65,14 @@ def strip_source_signatures(text: str) -> str:
 def format_for_channel(text: str, brand_tag: str = "") -> str:
     """متن نهایی آماده‌ی انتشار در کانال را می‌سازد."""
     body = strip_source_signatures(text)
+    body = strip_emojis(body)
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
 
     parts = []
     if body:
-        parts.append(body)
+        parts.append(f"🔴 {body}")   # ← فقط یک 🔴 در ابتدای متن
 
     if brand_tag:
-        parts.append(f"🔻 {brand_tag}")
+        parts.append(brand_tag)   # brand_tag هم دیگه بدون 🔻 اضافه میشه چون خودش ممکنه emoji-free باشه
 
     return "\n\n".join(parts).strip()

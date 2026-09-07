@@ -29,6 +29,7 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 }
 
+MAX_NEW_PER_CHANNEL_PER_CYCLE = 5
 
 def extract_username_from_url(url: str) -> str:
     """
@@ -92,15 +93,11 @@ def parse_messages(html: str, username: str) -> list[dict]:
 
 
 def build_post_text(source_name: str, msg: dict) -> str:
-    """متنی که در دیتابیس ذخیره و به ادمین نشان داده می‌شود را می‌سازد."""
     parts = []
     if msg["text"]:
         parts.append(msg["text"])
-    if msg["photo_url"]:
-        parts.append(f"🖼 {msg['photo_url']}")
-    parts.append(f"🔗 {msg['link']}")
+    parts.append(f"🔗 {msg['link']}")   # ← خط 🖼 حذف شد
     return "\n\n".join(parts)
-
 
 async def process_one_message(source_name: str, msg: dict, notify_callback):
     """یک پیام را از کل مسیر normalize → hash → duplicate → pending رد می‌کند."""
@@ -113,15 +110,24 @@ async def process_one_message(source_name: str, msg: dict, notify_callback):
     if not text.strip():
         return
 
+    norm = db.normalize_text(text)
+    h = db.make_hash(norm)
+    if await db.hash_already_seen(h):
+        logger.info(f"[{source_name}] محتوای تکراری (هش) نادیده گرفته شد: {msg['link']}")
+        return
+    
+    content_type = "photo" if msg["photo_url"] else "text"
+
     post_id = await db.add_post(
-        content_type="text",
+        content_type=content_type,
         text=text,
         user_id=None,
-        file_id=None,
+        file_id=msg["photo_url"],   # ← اینجا URL می‌ره، نه None
         source_type="telegram_channel",
         source_name=source_name,
         source_url=msg["link"],
     )
+    
     await db.log_action(post_id, "telegram_channel_fetched")
 
     logger.info(f"[{source_name}] پست جدید → #{post_id}: {msg['text'][:60]}")
@@ -149,9 +155,10 @@ async def fetch_all_channels(notify_callback):
             messages = parse_messages(html, username)
             logger.info(f"[{source_name}] {len(messages)} پست در صفحه یافت شد.")
 
-            for msg in messages:
+            for msg in messages[-MAX_NEW_PER_CHANNEL_PER_CYCLE:]:  # فقط جدیدترین‌ها
                 try:
                     await process_one_message(source_name, msg, notify_callback)
+                    await asyncio.sleep(1.5)  # فاصله بین نوتیف‌های ادمین
                 except Exception as e:
                     logger.error(f"[{source_name}] خطا در پردازش پست: {e}")
 

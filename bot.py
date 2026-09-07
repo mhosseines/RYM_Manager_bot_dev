@@ -40,6 +40,7 @@ BALE_CHANNEL_ID           = os.getenv("BALE_CHANNEL_ID")
 BALE_CHANNEL_USERNAME     = os.getenv("BALE_CHANNEL_USERNAME")
 TELEGRAM_CHANNEL_USERNAME = os.getenv("TELEGRAM_CHANNEL_USERNAME")
 BALE_API_URL              = f"https://tapi.bale.ai/bot{BALE_BOT_TOKEN}"
+BRAND_TAG = os.getenv("BRAND_TAG", "RYM")
 
 channel_slug = (TELEGRAM_CHANNEL_USERNAME or "").lstrip("@")
 
@@ -201,13 +202,18 @@ def build_admin_info_message(post, channel_link: str | None) -> str:
     source_name  = post["source_name"]
     source_url   = post["source_url"]
 
-    if source_type == "rss":
-        origin = f"📡 RSS  •  {source_name or 'بدون نام'}"
+    origin_labels = {
+        "rss": "📡 RSS",
+        "telegram_channel": "📡 تلگرام",
+        "bale_channel": "📨 بله",
+    }
+
+    if source_type in origin_labels:
+        origin = f"{origin_labels[source_type]}  •  {source_name or 'بدون نام'}"
         if source_url:
             origin += f"\n🔗 {source_url}"
     else:
         origin = f"👤 User  •  {post['user_id']}"
-
     lines = [
         f"📬 Post #{post_id}  |  📄 {content_type}",
         origin,
@@ -293,6 +299,8 @@ async def cmd_status(message: Message):
         "امروز:",
         f"👤 ارسال کاربران: {stats['user_submitted_today']}",
         f"📡 دریافت از RSS: {stats['rss_today']}",
+        f"📡 دریافت از تلگرام: {stats['telegram_today']}",
+        f"📨 دریافت از بله: {stats['bale_today']}",
         f"✅ منتشر شده: {stats['published_today']}",
         f"❌ رد شده: {stats['rejected_today']}",
         "",
@@ -332,11 +340,11 @@ async def cmd_pending(message: Message):
         source_name  = post["source_name"] or ""
         content_type = post["content_type"]
 
-        if source_type == "rss":
-            origin = f"📡 RSS — {source_name or 'بدون نام'}"
+        origin_labels = {"rss": "📡 RSS", "telegram_channel": "📡 تلگرام", "bale_channel": "📨 بله"}
+        if source_type in origin_labels:
+            origin = f"{origin_labels[source_type]} — {source_name or 'بدون نام'}"
         else:
             origin = f"👤 User — {post['user_id'] or '?'}"
-
         summary = "\n".join([
             f"📬 پست #{post_id}",
             origin,
