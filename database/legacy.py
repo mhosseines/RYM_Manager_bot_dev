@@ -1,7 +1,7 @@
 import hashlib
 import re
 import aiosqlite
-from datetime import datetime, date
+from datetime import datetime
 
 import logging
 logger = logging.getLogger(__name__)
@@ -16,8 +16,9 @@ DB_NAME = "posts.db"
 def normalize_text(text: str) -> str:
     if not text:
         return ""
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", "", text)
+    text = text.lower().translate(str.maketrans({"ي": "ی", "ى": "ی", "ك": "ک"}))
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"[^\w\s]", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -36,7 +37,9 @@ def compute_similarity(text_a: str, text_b: str) -> float:
         "was", "are", "be", "as", "so", "we", "he", "she", "they",
         "his", "her", "our", "its", "not", "no", "up", "out", "if", "do",
         "did", "has", "had", "have", "can", "will", "just", "been", "also",
-        "than", "then", "when", "what", "which", "who", "how", "all", "each"
+        "than", "then", "when", "what", "which", "who", "how", "all", "each",
+        "و", "در", "به", "از", "که", "را", "با", "برای", "این", "آن", "یک", "یا",
+        "است", "شد", "شده", "می", "بر", "هم", "اما", "تا", "پس", "نیز", "خود"
     }
 
     words_a = set(text_a.split()) - stop_words
@@ -149,6 +152,22 @@ async def init_db():
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sync_state (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS mirrored_messages (
+                source_chat_id TEXT NOT NULL,
+                source_msg_id  TEXT NOT NULL,
+                target_msg_id  INTEGER,
+                mirrored_at    TEXT NOT NULL,
+                PRIMARY KEY (source_chat_id, source_msg_id)
+            )
+        """)
+
         await db.commit()
 
         # Safe column migrations — never deletes data
@@ -172,6 +191,10 @@ async def init_db():
             except Exception:
                 pass
 
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_posts_status_created ON posts(status, created_at)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_posts_source_url ON posts(source_url)")
+        await db.commit()
+
 
 # ────────────────────────────────────────────
 # BLOCKED USERS
@@ -179,7 +202,7 @@ async def init_db():
 
 async def block_user(user_id: int, reason: str = ""):
     """Add a user to the blocked list."""
-    blocked_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    blocked_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
             "INSERT OR REPLACE INTO blocked_users (user_id, reason, blocked_at) VALUES (?, ?, ?)",
@@ -285,6 +308,42 @@ async def delete_source(source_id: int):
         await db.commit()
 
 
+async def get_sync_state(key: str) -> str | None:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("SELECT value FROM sync_state WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def set_sync_state(key: str, value: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT INTO sync_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        await db.commit()
+
+
+async def is_mirrored_message(source_chat_id: str, source_msg_id: str) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM mirrored_messages WHERE source_chat_id = ? AND source_msg_id = ?",
+            (source_chat_id, source_msg_id),
+        )
+        return await cursor.fetchone() is not None
+
+
+async def mark_message_mirrored(source_chat_id: str, source_msg_id: str, target_msg_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO mirrored_messages "
+            "(source_chat_id, source_msg_id, target_msg_id, mirrored_at) VALUES (?, ?, ?, ?)",
+            (source_chat_id, source_msg_id, target_msg_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        await db.commit()
+
+
 # ────────────────────────────────────────────
 # POSTS
 # ────────────────────────────────────────────
@@ -314,14 +373,15 @@ async def add_post(
     h    = make_hash(norm) if norm else ""
     similarity_flag = None
     similar_post_id = None
-    created_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     async with aiosqlite.connect(DB_NAME) as db:
 
         # Duplicate check — only published posts count
         if h:
             cursor = await db.execute(
-                "SELECT id FROM posts WHERE hash = ? AND status = 'published' LIMIT 1", (h,)
+                "SELECT id FROM posts WHERE hash = ? AND status = 'published' "
+                "AND COALESCE(source_type, '') != 'bale_sync' LIMIT 1", (h,)
             )
             duplicate_row = await cursor.fetchone()
 
@@ -331,7 +391,7 @@ async def add_post(
             else:
                 cursor = await db.execute(
                     """SELECT id, normalized_text FROM posts
-                       WHERE status = 'published'
+                       WHERE status = 'published' AND COALESCE(source_type, '') != 'bale_sync'
                        ORDER BY id DESC LIMIT 50"""
                 )
                 recent_posts = await cursor.fetchall()
@@ -381,7 +441,8 @@ async def check_duplicate(text: str):
 
         async with aiosqlite.connect(DB_NAME) as db:
             cursor = await db.execute(
-                "SELECT id FROM posts WHERE hash = ? AND status = 'published' LIMIT 1", (h,)
+                "SELECT id FROM posts WHERE hash = ? AND status = 'published' "
+                "AND COALESCE(source_type, '') != 'bale_sync' LIMIT 1", (h,)
             )
             duplicate_row = await cursor.fetchone()
 
@@ -391,7 +452,7 @@ async def check_duplicate(text: str):
             else:
                 cursor = await db.execute(
                     """SELECT id, normalized_text FROM posts
-                    WHERE status = 'published'
+                    WHERE status = 'published' AND COALESCE(source_type, '') != 'bale_sync'
                     ORDER BY id DESC LIMIT 50"""
                 )
                 recent_posts = await cursor.fetchall()
@@ -452,7 +513,8 @@ async def hash_already_seen(h: str) -> bool:
         return False
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
-            "SELECT id FROM posts WHERE hash = ? LIMIT 1", (h,)
+            "SELECT id FROM posts WHERE hash = ? "
+            "AND COALESCE(source_type, '') != 'bale_sync' LIMIT 1", (h,)
         )
         return await cursor.fetchone() is not None
 
@@ -463,6 +525,41 @@ async def update_status(post_id: int, status: str):
             "UPDATE posts SET status = ? WHERE id = ?", (status, post_id)
         )
         await db.commit()
+
+
+async def claim_pending_post(post_id: int) -> bool:
+    """Atomically reserve a post so concurrent admins cannot publish it twice."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "UPDATE posts SET status = 'publishing' WHERE id = ? AND status = 'pending'",
+            (post_id,),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def reject_pending_post(post_id: int) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "UPDATE posts SET status = 'rejected' WHERE id = ? AND status = 'pending'",
+            (post_id,),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def update_pending_post_text(post_id: int, text: str) -> bool:
+    """Edit a queued post without allowing an already-reviewed post to change."""
+    norm = normalize_text(text)
+    h = make_hash(norm) if norm else ""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "UPDATE posts SET text = ?, normalized_text = ?, hash = ?, similarity_flag = NULL, "
+            "similar_post_id = NULL WHERE id = ? AND status = 'pending'",
+            (text, norm, h, post_id),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
 
 
 async def save_channel_msg_id(post_id: int, msg_id: int):
@@ -478,7 +575,7 @@ async def save_channel_msg_id(post_id: int, msg_id: int):
 # ────────────────────────────────────────────
 
 async def get_stats() -> dict:
-    today = date.today().strftime("%Y-%m-%d")
+    today = datetime.now().strftime("%Y-%m-%d")
 
     async with aiosqlite.connect(DB_NAME) as db:
 
@@ -573,7 +670,7 @@ async def get_pending_posts(limit: int = 10) -> list:
 # ────────────────────────────────────────────
 
 async def log_action(post_id: int, action: str):
-    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
             "INSERT INTO logs (post_id, action, timestamp) VALUES (?, ?, ?)",
